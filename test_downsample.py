@@ -45,13 +45,26 @@ FAILURE_KIND = {
 
 
 def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9,
-                  expected_sources=None, actual_sources=None):
+                  expected_sources=None, actual_sources=None,
+                  group_name=None, bucket_series_sources=None):
     """Compare two lists of (ts, val) pairs with clear failure categorization."""
     ok = True
     failure_kind = None
 
+    group_prefix = f"[{group_name}] " if group_name else ""
+
+    def summarize_sources(i):
+        parts = []
+        if actual_sources and i < len(actual_sources):
+            parts.append(f"bucket_src={actual_sources[i]}")
+        if bucket_series_sources and i < len(bucket_series_sources) and bucket_series_sources[i]:
+            ss = bucket_series_sources[i]
+            summary = ','.join(f'{k}:{v}' for k, v in sorted(ss.items()))
+            parts.append(f"lines={{{summary}}}")
+        return ' | '.join(parts) if parts else None
+
     if len(expected) != len(actual):
-        print(f"  ✗ [{name}] {FAILURE_KIND['LENGTH_MISMATCH']}")
+        print(f"  ✗ {group_prefix}[{name}] {FAILURE_KIND['LENGTH_MISMATCH']}")
         print(f"    期望 {len(expected)} 个桶, 实际 {len(actual)} 个桶")
         if len(expected) <= 50:
             print(f"    期望: {expected}")
@@ -61,39 +74,41 @@ def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9,
     else:
         for i, ((e_t, e_v), (a_t, a_v)) in enumerate(zip(expected, actual)):
             if e_t != a_t:
-                print(f"  ✗ [{name}] {FAILURE_KIND['TIMESTAMP_LEAK']} 第{i}个桶")
-                print(f"    期望时间戳 {e_t}, 实际 {a_t}")
+                print(f"  ✗ {group_prefix}[{name}] {FAILURE_KIND['TIMESTAMP_LEAK']} 第{i}个桶(t={e_t})")
+                print(f"    期望时间戳 {e_t}, 实际 {a_t}, 差={a_t - e_t}")
+                src = summarize_sources(i)
+                if src:
+                    print(f"    {src}")
                 if t_start is not None:
                     if a_t < t_start:
                         print(f"    原因: 桶时间戳 {a_t} < 查询起点 {t_start}")
                     elif a_t > t_end:
                         print(f"    原因: 桶时间戳 {a_t} > 查询终点 {t_end}")
-                if actual_sources and i < len(actual_sources):
-                    print(f"    桶来源: {actual_sources[i]}")
                 failure_kind = failure_kind or 'TIMESTAMP_LEAK'
                 ok = False
             elif abs(e_v - a_v) > eps:
-                print(f"  ✗ [{name}] {FAILURE_KIND['VALUE_MISMATCH']} 第{i}个桶(t={e_t})")
+                print(f"  ✗ {group_prefix}[{name}] {FAILURE_KIND['VALUE_MISMATCH']} 第{i}个桶(t={e_t})")
                 print(f"    期望 {e_v}, 实际 {a_v}, 差={abs(e_v-a_v)}")
-                if actual_sources and i < len(actual_sources):
-                    print(f"    桶来源: {actual_sources[i]}")
+                src = summarize_sources(i)
+                if src:
+                    print(f"    {src}")
                 failure_kind = failure_kind or 'VALUE_MISMATCH'
                 ok = False
 
     if t_start is not None and t_end is not None and actual:
         for bts, _ in actual:
             if bts < t_start:
-                print(f"  ✗ [{name}] {FAILURE_KIND['TIMESTAMP_LEAK']}: 桶 {bts} < 查询起点 {t_start}")
+                print(f"  ✗ {group_prefix}[{name}] {FAILURE_KIND['TIMESTAMP_LEAK']}: 桶 {bts} < 查询起点 {t_start}")
                 ok = False
                 failure_kind = failure_kind or 'TIMESTAMP_LEAK'
             if bts > t_end:
-                print(f"  ✗ [{name}] {FAILURE_KIND['TIMESTAMP_LEAK']}: 桶 {bts} > 查询终点 {t_end}")
+                print(f"  ✗ {group_prefix}[{name}] {FAILURE_KIND['TIMESTAMP_LEAK']}: 桶 {bts} > 查询终点 {t_end}")
                 ok = False
                 failure_kind = failure_kind or 'TIMESTAMP_LEAK'
 
     if expected_sources is not None and actual_sources is not None:
         if len(expected_sources) != len(actual_sources):
-            print(f"  ✗ [{name}] 桶来源长度不匹配: 期望 {len(expected_sources)}, 实际 {len(actual_sources)}")
+            print(f"  ✗ {group_prefix}[{name}] 桶来源长度不匹配: 期望 {len(expected_sources)}, 实际 {len(actual_sources)}")
             print(f"    期望: {expected_sources}")
             print(f"    实际: {actual_sources}")
             ok = False
@@ -106,14 +121,18 @@ def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9,
                     match_ok = asrc in es
                 if not match_ok:
                     ts = actual[i][0] if i < len(actual) else '?'
-                    print(f"  ✗ [{name}] 桶来源不匹配 第{i}个桶(t={ts})")
+                    print(f"  ✗ {group_prefix}[{name}] 桶来源不匹配 第{i}个桶(t={ts})")
                     print(f"    期望 {es}, 实际 {asrc}")
+                    src = summarize_sources(i)
+                    if src:
+                        print(f"    {src}")
                     ok = False
                     failure_kind = failure_kind or 'SOURCE_MISMATCH'
 
     if ok:
         extra = f" (范围 [{t_start}, {t_end}])" if t_start else ""
-        print(f"  ✓ [{name}] 通过 ({len(expected)} 个桶完全一致{extra})")
+        grp = f" [{group_name}]" if group_name else ""
+        print(f"  ✓{grp} [{name}] 通过 ({len(expected)} 个桶完全一致{extra})")
     return ok, failure_kind
 
 
@@ -739,15 +758,16 @@ def test_misaligned_few_middle():
 
 def test_cross_series_downsample_agg():
     """
-    TEST 11: 跨序列降采样聚合。
+    TEST 11: 跨序列降采样聚合 (新语义: 先每条线降采样, 再聚合)。
     - 构造同一 metric 下多条序列
     - 用 cross_series_agg='avg'/'sum' 合并
-    - 正确基线: 把所有匹配序列的原始点合并后，按桶做 cross_agg
+    - 正确基线: 先每条线独立降采样 (per_series_agg), 再对同一桶的
+               per-series values 做 cross_agg
     - 验证: 结果与基线一致, 每条线复用预聚合, 输出来源 cross_merged
     """
     print()
     print("=" * 70)
-    print("  TEST 11: 跨序列降采样聚合 (多条线复用预聚合)")
+    print("  TEST 11: 跨序列降采样聚合 (先每条线降采样, 再聚合)")
     print("=" * 70)
 
     storage = StorageEngine()
@@ -767,34 +787,57 @@ def test_cross_series_downsample_agg():
     t_start = base_ts
     t_end = base_ts + 3600 - 1
     interval = 1800
+    per_series_agg = 'avg'
 
     all_ok = True
 
-    series_ids = list(storage.index.get_all_series_for_metric('cpu'))
-    all_raw_points = []
-    for sid in series_ids:
-        all_raw_points.extend(bucket_raw_in_range(storage, sid, t_start, t_end))
-
+    series_ids = sorted(list(storage.index.get_all_series_for_metric('cpu')))
     from tsdb.aggregation import aggregate as aggr
 
     for cross_agg in ['sum', 'avg', 'min', 'max', 'count']:
         opt_result = query.query(
             'cpu', {'region': 'us-east'}, t_start, t_end,
-            agg_func='avg', interval=interval, cross_series_agg=cross_agg
+            agg_func=per_series_agg, interval=interval, cross_series_agg=cross_agg
         )
 
-        baseline = baseline_downsample(all_raw_points, t_start, t_end, interval, cross_agg)
+        per_series_downsampled = {}
+        for sid in series_ids:
+            pts, _, _ = query._query_downsampled(
+                sid, t_start, t_end, per_series_agg, interval
+            )
+            per_series_downsampled[sid] = {t: v for t, v in pts}
+
+        first_bt_floor = (t_start // interval) * interval
+        last_bt_floor = (t_end // interval) * interval
+
+        baseline = []
+        for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+            vals = []
+            for sid in series_ids:
+                if dst_bt in per_series_downsampled[sid]:
+                    vals.append((dst_bt, per_series_downsampled[sid][dst_bt]))
+            if vals:
+                out_bt = dst_bt if dst_bt >= t_start else t_start
+                baseline.append((out_bt, aggr(vals, cross_agg)))
 
         actual = opt_result[0].points if opt_result else []
         actual_sources = opt_result[0].bucket_sources if opt_result else []
+        actual_series_sources = opt_result[0].bucket_series_sources if opt_result else []
         stats = opt_result[0].stats if opt_result else None
 
         ok, _ = assert_close(f"跨序列 {cross_agg} (30m)", baseline, actual, t_start, t_end,
-                              actual_sources=actual_sources)
+                              actual_sources=actual_sources,
+                              bucket_series_sources=actual_series_sources)
         all_ok = all_ok and ok
 
         if stats:
             print(f"    桶来源计数: {stats.get('bucket_source_counts', {})}")
+
+        if actual_series_sources:
+            for i, ss in enumerate(actual_series_sources[:2]):
+                if ss:
+                    summary = ','.join(f'{k}:{v}' for k, v in sorted(ss.items()))
+                    print(f"    桶 {i} 各线来源: {{{summary}}}")
 
         if actual_sources:
             all_cross = all(s == 'cross_merged' for s in actual_sources)
@@ -807,10 +850,281 @@ def test_cross_series_downsample_agg():
     return all_ok
 
 
+def test_cross_series_semantics_difference():
+    """
+    TEST 12: 对比"先每条线降采样再聚合" vs "直接混原始点"两种语义不是一回事。
+    - 构造数据: 机器A 100个点 val=10, 机器B 5个点 val=100
+    - 语义1 (新): 先各线 avg 得 [10, 100], 再 avg 得 55.0
+    - 语义2 (混点): 总 avg = (100*10 + 5*100) / 105 ≈ 14.2857
+    - 终端自检明确打印两者差异
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 12: 跨序列两种语义差异对比 (不均匀采样)")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+
+    for i in range(100):
+        ts = base_ts + i * 1
+        val = 10.0
+        storage.write('cpu', {'host': 'A', 'service': 'api'}, ts, val)
+    for i in range(5):
+        ts = base_ts + i * 60
+        val = 100.0
+        storage.write('cpu', {'host': 'B', 'service': 'api'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 1800 - 1
+    interval = 1800
+
+    opt_result = query.query(
+        'cpu', {'service': 'api'}, t_start, t_end,
+        agg_func='avg', interval=interval, cross_series_agg='avg'
+    )
+
+    cross_val = opt_result[0].points[0][1] if opt_result and opt_result[0].points else None
+
+    series_ids = list(storage.index.get_all_series_for_metric('cpu'))
+    all_raw = []
+    for sid in series_ids:
+        all_raw.extend(bucket_raw_in_range(storage, sid, t_start, t_end))
+    from tsdb.aggregation import aggregate as aggr
+    mixed_val = aggr(all_raw, 'avg')
+
+    print(f"  机器A: 100 个点, val=10")
+    print(f"  机器B:   5 个点, val=100")
+    print(f"  语义1 (先各线avg再avg): ({10.0} + {100.0}) / 2 = {55.0:.4f}")
+    print(f"  语义2 (混原始点直接avg): (100*10 + 5*100) / 105 = {mixed_val:.4f}")
+    print(f"  查询结果 (语义1): {cross_val:.4f}")
+
+    all_ok = True
+    expected_per_series_then_agg = 55.0
+    if abs(cross_val - expected_per_series_then_agg) < 1e-6:
+        print(f"  ✓ 查询结果正确使用语义1 (先各线降采样再聚合)")
+    else:
+        print(f"  ✗ 结果 {cross_val:.4f} 与期望 {expected_per_series_then_agg:.4f} 不符!")
+        all_ok = False
+
+    if abs(cross_val - mixed_val) > 1e-6:
+        print(f"  ✓ 确认两种语义结果不同: {cross_val:.4f} vs {mixed_val:.4f}")
+    else:
+        print(f"  ⚠ 两种语义结果相同, 差异不明显")
+
+    return all_ok
+
+
+def test_group_by_tag_downsample():
+    """
+    TEST 13: 按标签分组的降采样聚合。
+    - 构造数据: 多 region × 多 host
+    - 按 region 分组, 每组内部先各线降采样, 再聚合
+    - 验证: 每个 region 返回一条曲线, 值正确, 来源诊断完整
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 13: 按标签分组降采样聚合 (group by region)")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+    scenarios = [
+        ('web-01', 'us-east', 10.0),
+        ('web-02', 'us-east', 20.0),
+        ('web-03', 'eu-west', 30.0),
+        ('web-04', 'eu-west', 40.0),
+        ('web-05', 'eu-west', 50.0),
+    ]
+
+    for host, region, base_val in scenarios:
+        for i in range(360):
+            ts = base_ts + i * 10
+            val = base_val + math.sin(i * 0.05)
+            storage.write('cpu', {'host': host, 'region': region, 'service': 'api'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 3600 - 1
+    interval = 1800
+
+    results = query.query(
+        'cpu', {'service': 'api'}, t_start, t_end,
+        agg_func='avg', interval=interval, cross_series_agg='avg', group_by='region'
+    )
+
+    print(f"  返回分组结果数: {len(results)}")
+    for r in results:
+        print(f"    分组: {r.group_key}, tags: {r.tags}, 桶数: {len(r.points)}")
+
+    all_ok = True
+    if len(results) != 2:
+        print(f"  ✗ 期望 2 个分组 (us-east, eu-west), 实际 {len(results)}")
+        all_ok = False
+    else:
+        group_keys = {r.group_key for r in results}
+        expected_keys = {'cpu::region=us-east', 'cpu::region=eu-west'}
+        if group_keys == expected_keys:
+            print(f"  ✓ 分组 key 正确: {sorted(group_keys)}")
+        else:
+            print(f"  ✗ 分组 key 不符, 期望 {expected_keys}, 实际 {group_keys}")
+            all_ok = False
+
+    from tsdb.aggregation import aggregate as aggr
+
+    for r in results:
+        group_name = r.group_key
+        region = r.tags.get('region')
+        series_ids = sorted(storage.index.match('cpu', {'service': 'api', 'region': region}))
+
+        per_series_downsampled = {}
+        for sid in series_ids:
+            pts, _, _ = query._query_downsampled(sid, t_start, t_end, 'avg', interval)
+            per_series_downsampled[sid] = {t: v for t, v in pts}
+
+        first_bt_floor = (t_start // interval) * interval
+        last_bt_floor = (t_end // interval) * interval
+        baseline = []
+        for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+            vals = []
+            for sid in series_ids:
+                if dst_bt in per_series_downsampled[sid]:
+                    vals.append((dst_bt, per_series_downsampled[sid][dst_bt]))
+            if vals:
+                out_bt = dst_bt if dst_bt >= t_start else t_start
+                baseline.append((out_bt, aggr(vals, 'avg')))
+
+        ok, _ = assert_close(
+            f"分组 {region} avg (30m)",
+            baseline, r.points, t_start, t_end,
+            actual_sources=r.bucket_sources,
+            bucket_series_sources=r.bucket_series_sources,
+            group_name=group_name
+        )
+        all_ok = all_ok and ok
+
+        if r.bucket_series_sources:
+            for i, ss in enumerate(r.bucket_series_sources):
+                if ss:
+                    summary = ','.join(f'{k}:{v}' for k, v in sorted(ss.items()))
+                    print(f"    [{group_name}] 桶 {i} 各线来源: {{{summary}}}")
+
+    return all_ok
+
+
+def test_uneven_and_missing_series():
+    """
+    TEST 14: 不均匀采样 + 缺线场景。
+    - 有的序列某些桶没数据
+    - 验证: 某序列缺数据时不影响其他序列的计算, 整组不崩
+    - 失败输出: 分组名、桶时间、期望值、实际值、来源摘要
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 14: 不均匀采样 + 缺线场景 (缺桶不崩)")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+
+    for i in range(720):
+        ts = base_ts + i * 10
+        val = 10.0
+        storage.write('cpu', {'host': 'full', 'service': 'api'}, ts, val)
+
+    for i in range(180):
+        ts = base_ts + i * 10
+        val = 20.0
+        storage.write('cpu', {'host': 'partial-early', 'service': 'api'}, ts, val)
+
+    for i in range(180):
+        ts = base_ts + 3600 + i * 10
+        val = 30.0
+        storage.write('cpu', {'host': 'partial-late', 'service': 'api'}, ts, val)
+
+    for i in range(10):
+        ts = base_ts + i * 1
+        val = 100.0
+        storage.write('cpu', {'host': 'sparse', 'service': 'api'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 7200 - 1
+    interval = 1800
+
+    print(f"  数据说明:")
+    print(f"    host=full:         完整数据, 2小时全程, val=10")
+    print(f"    host=partial-early: 仅前半小时, val=20")
+    print(f"    host=partial-late:  仅第2小时开始, val=30")
+    print(f"    host=sparse:       仅前10秒, val=100 (极不均匀)")
+
+    results = query.query(
+        'cpu', {'service': 'api'}, t_start, t_end,
+        agg_func='avg', interval=interval, cross_series_agg='avg'
+    )
+
+    actual = results[0].points if results else []
+    actual_sources = results[0].bucket_sources if results else []
+    actual_series_sources = results[0].bucket_series_sources if results else []
+    series_ids = sorted(list(storage.index.get_all_series_for_metric('cpu')))
+
+    from tsdb.aggregation import aggregate as aggr
+    per_series_downsampled = {}
+    for sid in series_ids:
+        pts, _, _ = query._query_downsampled(sid, t_start, t_end, 'avg', interval)
+        per_series_downsampled[sid] = {t: v for t, v in pts}
+
+    first_bt_floor = (t_start // interval) * interval
+    last_bt_floor = (t_end // interval) * interval
+    baseline = []
+    for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+        vals = []
+        for sid in series_ids:
+            if dst_bt in per_series_downsampled[sid]:
+                vals.append((dst_bt, per_series_downsampled[sid][dst_bt]))
+        if vals:
+            out_bt = dst_bt if dst_bt >= t_start else t_start
+            baseline.append((out_bt, aggr(vals, 'avg')))
+
+    print(f"\n  各桶期望 vs 实际:")
+    for i, (e_t, e_v) in enumerate(baseline):
+        if i < len(actual):
+            a_t, a_v = actual[i]
+            src = actual_series_sources[i] if i < len(actual_series_sources) else None
+            src_str = ''
+            if src:
+                src_str = ' lines={' + ','.join(f'{k}:{v}' for k, v in sorted(src.items())) + '}'
+            print(f"    桶 {i} t={e_t}: 期望={e_v:.4f}, 实际={a_v:.4f}, 差={abs(a_v-e_v):.4f}{src_str}")
+
+    all_ok = True
+    ok, _ = assert_close("跨序列 avg (缺线场景)", baseline, actual, t_start, t_end,
+                          actual_sources=actual_sources,
+                          bucket_series_sources=actual_series_sources)
+    all_ok = all_ok and ok
+
+    if actual_series_sources and len(actual_series_sources) >= 4:
+        bucket0 = actual_series_sources[0]
+        bucket3 = actual_series_sources[3]
+        missing_in_bucket3 = any(v == 'missing' for v in bucket3.values())
+        if missing_in_bucket3:
+            print(f"  ✓ 末桶正确标记部分序列为 missing")
+        else:
+            print(f"  ⚠ 末桶来源: {bucket3}")
+
+    return all_ok
+
+
 def main():
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║    降采样正确性自检 — 11 个测试场景                              ║")
+    print("║    降采样正确性自检 — 14 个测试场景                              ║")
     print("║    每一项都与 \"全扫原始点再聚合\" 的基线结果逐桶比对             ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
     print()
@@ -830,7 +1144,10 @@ def main():
     results.append(("TEST 8 单桶对齐预聚合命中", test_single_bucket_pre_agg()))
     results.append(("TEST 9 两桶对齐预聚合命中", test_two_buckets_pre_agg()))
     results.append(("TEST 10 少中间桶场景", test_misaligned_few_middle()))
-    results.append(("TEST 11 跨序列降采样聚合", test_cross_series_downsample_agg()))
+    results.append(("TEST 11 跨序列先各线降采样再聚合", test_cross_series_downsample_agg()))
+    results.append(("TEST 12 跨序列两种语义差异对比", test_cross_series_semantics_difference()))
+    results.append(("TEST 13 按标签分组降采样聚合", test_group_by_tag_downsample()))
+    results.append(("TEST 14 缺线场景不崩 + 来源诊断", test_uneven_and_missing_series()))
 
     print()
     print("=" * 70)
@@ -843,11 +1160,14 @@ def main():
         all_pass = all_pass and ok
     print()
     if all_pass:
-        print("  🎉 全部 11 个测试通过!")
-        print("     TEST 1-7: 原有边界正确性 + 预聚合合并路径验证")
-        print("     TEST 8-9: 1 桶 / 2 桶对齐查询正确命中预聚合")
-        print("     TEST 10:  首尾不对齐但中间只有很少完整桶")
-        print("     TEST 11:  跨序列降采样聚合, 复用每条线预聚合")
+        print("  🎉 全部 14 个测试通过!")
+        print("     TEST 1-7:  原有边界正确性 + 预聚合合并路径验证")
+        print("     TEST 8-9:  1 桶 / 2 桶对齐查询正确命中预聚合")
+        print("     TEST 10:   首尾不对齐但中间只有很少完整桶")
+        print("     TEST 11:   跨序列降采样聚合 (先每条线降采样, 再聚合)")
+        print("     TEST 12:   跨序列两种语义差异对比 (不均匀采样)")
+        print("     TEST 13:   按标签分组降采样聚合 (group by region)")
+        print("     TEST 14:   缺线场景不崩 + 每桶各线来源诊断")
     else:
         print("  ⚠ 存在失败测试, 请检查上方输出中标记的错误类型。")
     return all_pass
