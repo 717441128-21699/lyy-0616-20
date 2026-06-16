@@ -40,10 +40,12 @@ FAILURE_KIND = {
     'LENGTH_MISMATCH': '返回桶数与基线不一致',
     'PRE_AGG_MISS': '应该命中预聚合合并但没有',
     'DATA_LEAK': '范围外数据污染结果',
+    'SOURCE_MISMATCH': '桶来源诊断不符合预期',
 }
 
 
-def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9):
+def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9,
+                  expected_sources=None, actual_sources=None):
     """Compare two lists of (ts, val) pairs with clear failure categorization."""
     ok = True
     failure_kind = None
@@ -66,11 +68,15 @@ def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9):
                         print(f"    原因: 桶时间戳 {a_t} < 查询起点 {t_start}")
                     elif a_t > t_end:
                         print(f"    原因: 桶时间戳 {a_t} > 查询终点 {t_end}")
+                if actual_sources and i < len(actual_sources):
+                    print(f"    桶来源: {actual_sources[i]}")
                 failure_kind = failure_kind or 'TIMESTAMP_LEAK'
                 ok = False
             elif abs(e_v - a_v) > eps:
                 print(f"  ✗ [{name}] {FAILURE_KIND['VALUE_MISMATCH']} 第{i}个桶(t={e_t})")
                 print(f"    期望 {e_v}, 实际 {a_v}, 差={abs(e_v-a_v)}")
+                if actual_sources and i < len(actual_sources):
+                    print(f"    桶来源: {actual_sources[i]}")
                 failure_kind = failure_kind or 'VALUE_MISMATCH'
                 ok = False
 
@@ -84,6 +90,26 @@ def assert_close(name, expected, actual, t_start=None, t_end=None, eps=1e-9):
                 print(f"  ✗ [{name}] {FAILURE_KIND['TIMESTAMP_LEAK']}: 桶 {bts} > 查询终点 {t_end}")
                 ok = False
                 failure_kind = failure_kind or 'TIMESTAMP_LEAK'
+
+    if expected_sources is not None and actual_sources is not None:
+        if len(expected_sources) != len(actual_sources):
+            print(f"  ✗ [{name}] 桶来源长度不匹配: 期望 {len(expected_sources)}, 实际 {len(actual_sources)}")
+            print(f"    期望: {expected_sources}")
+            print(f"    实际: {actual_sources}")
+            ok = False
+        else:
+            for i, (es, asrc) in enumerate(zip(expected_sources, actual_sources)):
+                match_ok = False
+                if isinstance(es, str):
+                    match_ok = (es == asrc)
+                elif isinstance(es, (list, tuple, set)):
+                    match_ok = asrc in es
+                if not match_ok:
+                    ts = actual[i][0] if i < len(actual) else '?'
+                    print(f"  ✗ [{name}] 桶来源不匹配 第{i}个桶(t={ts})")
+                    print(f"    期望 {es}, 实际 {asrc}")
+                    ok = False
+                    failure_kind = failure_kind or 'SOURCE_MISMATCH'
 
     if ok:
         extra = f" (范围 [{t_start}, {t_end}])" if t_start else ""
@@ -515,10 +541,276 @@ def test_pre_agg_merge_hit_for_uneven_avg():
     return all_ok
 
 
+def test_single_bucket_pre_agg():
+    """
+    TEST 8: 单个桶对齐查询必须命中预聚合。
+    - 构造 1 小时完整对齐数据
+    - 查询刚好 30 分钟 (单桶) 对齐范围
+    - 验证: stats.pre_agg_buckets_used == 1
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 8: 单桶查询 (30分钟) 必须命中预聚合")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+
+    for i in range(180):
+        ts = base_ts + i * 10
+        val = 20.0 + i * 0.1
+        storage.write('cpu', {'host': 'srv8'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 1800 - 1
+    interval = 1800
+
+    series_id = list(storage.index.get_all_series_for_metric('cpu'))[0]
+    raw_points = bucket_raw_in_range(storage, series_id, t_start, t_end)
+    baseline = baseline_downsample(raw_points, t_start, t_end, interval, 'avg')
+
+    opt_result = query.query(
+        'cpu', {'host': 'srv8'}, t_start, t_end,
+        agg_func='avg', interval=interval
+    )
+    actual = opt_result[0].points if opt_result else []
+    actual_sources = opt_result[0].bucket_sources if opt_result else []
+    stats = opt_result[0].stats if opt_result else None
+
+    print(f"  查询范围: [{t_start}, {t_end}] (对齐 30 分钟, 单桶)")
+    print(f"  降采样间隔: {interval}s")
+    print(f"  原始点数: {len(raw_points)}")
+
+    all_ok = True
+    expected_sources = ['pre_agg:1', 'pre_agg:n']
+    ok, _ = assert_close("30m avg (单桶)", baseline, actual, t_start, t_end,
+                          actual_sources=actual_sources)
+    all_ok = all_ok and ok
+
+    if stats:
+        print(f"  命中统计: 预聚合={stats['pre_agg_buckets_used']}, "
+              f"原始={stats['raw_buckets_used']}, 粒度={stats['source_granularity']}")
+        if stats['pre_agg_buckets_used'] >= 1:
+            print(f"  ✓ 单桶查询命中预聚合 (pre_agg={stats['pre_agg_buckets_used']})")
+        else:
+            print(f"  ✗ {FAILURE_KIND['PRE_AGG_MISS']}: 单桶查询未命中预聚合!")
+            all_ok = False
+
+    if actual_sources:
+        print(f"  桶来源: {actual_sources}")
+        if actual_sources[0] in expected_sources:
+            print(f"  ✓ 桶来源正确: {actual_sources[0]}")
+        else:
+            print(f"  ✗ 桶来源错误: 期望 {expected_sources}, 实际 {actual_sources[0]}")
+            all_ok = False
+
+    return all_ok
+
+
+def test_two_buckets_pre_agg():
+    """
+    TEST 9: 两个桶对齐查询必须全部命中预聚合。
+    - 构造 1 小时完整数据
+    - 查询刚好 1 小时 (2 个 30min 桶) 对齐范围
+    - 验证: 两个桶都来自预聚合
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 9: 两桶查询 (2×30分钟) 必须全部命中预聚合")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+
+    for i in range(360):
+        ts = base_ts + i * 10
+        val = 30.0 + i * 0.05
+        storage.write('cpu', {'host': 'srv9'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 3600 - 1
+    interval = 1800
+
+    series_id = list(storage.index.get_all_series_for_metric('cpu'))[0]
+    raw_points = bucket_raw_in_range(storage, series_id, t_start, t_end)
+    baseline = baseline_downsample(raw_points, t_start, t_end, interval, 'sum')
+
+    opt_result = query.query(
+        'cpu', {'host': 'srv9'}, t_start, t_end,
+        agg_func='sum', interval=interval
+    )
+    actual = opt_result[0].points if opt_result else []
+    actual_sources = opt_result[0].bucket_sources if opt_result else []
+    stats = opt_result[0].stats if opt_result else None
+
+    all_ok = True
+    ok, _ = assert_close("30m sum (两桶)", baseline, actual, t_start, t_end,
+                          actual_sources=actual_sources)
+    all_ok = all_ok and ok
+
+    if stats:
+        print(f"  命中统计: 预聚合={stats['pre_agg_buckets_used']}, 原始={stats['raw_buckets_used']}")
+        if stats['pre_agg_buckets_used'] >= 2:
+            print(f"  ✓ 两桶查询全部命中预聚合")
+        else:
+            print(f"  ✗ {FAILURE_KIND['PRE_AGG_MISS']}: 期望 2 桶预聚合, 实际 {stats['pre_agg_buckets_used']}")
+            all_ok = False
+
+    if actual_sources:
+        print(f"  桶来源: {actual_sources}")
+        pre_agg_src = {'pre_agg:1', 'pre_agg:n'}
+        for i, s in enumerate(actual_sources):
+            if s in pre_agg_src:
+                print(f"    桶 {i}: {s} ✓")
+            else:
+                print(f"    桶 {i}: {s} ✗")
+                all_ok = False
+
+    return all_ok
+
+
+def test_misaligned_few_middle():
+    """
+    TEST 10: 首尾不对齐但中间只有很少完整桶的场景。
+    - 查询范围: 开头部分桶 + 1 个完整桶 + 末尾部分桶
+    - 验证: 完整桶来自预聚合, 边缘桶来自 raw
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 10: 首尾不对齐+少中间桶 (边缘raw + 中间pre_agg)")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+
+    for i in range(1080):
+        ts = base_ts + i * 10
+        val = 40.0 + math.sin(i * 0.05) * 10
+        storage.write('cpu', {'host': 'srv10'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts + 10 * 60
+    t_end = base_ts + 1 * 3600 + 20 * 60
+    interval = 1800
+
+    print(f"  查询范围: [{t_start}, {t_end}]")
+    print(f"  桶划分:")
+    first_bt = (t_start // interval) * interval
+    print(f"    桶0: [{first_bt}, {first_bt+interval-1}] → 重叠 [{max(first_bt, t_start)}, {min(first_bt+interval-1, t_end)}] (部分桶)")
+    mid_bt = first_bt + interval
+    print(f"    桶1: [{mid_bt}, {mid_bt+interval-1}] → 完全在范围内 (完整桶)")
+    last_bt = mid_bt + interval
+    print(f"    桶2: [{last_bt}, {last_bt+interval-1}] → 重叠 [{max(last_bt, t_start)}, {min(last_bt+interval-1, t_end)}] (部分桶)")
+
+    series_id = list(storage.index.get_all_series_for_metric('cpu'))[0]
+    raw_points = bucket_raw_in_range(storage, series_id, t_start, t_end)
+    baseline = baseline_downsample(raw_points, t_start, t_end, interval, 'avg')
+
+    opt_result = query.query(
+        'cpu', {'host': 'srv10'}, t_start, t_end,
+        agg_func='avg', interval=interval
+    )
+    actual = opt_result[0].points if opt_result else []
+    actual_sources = opt_result[0].bucket_sources if opt_result else []
+    stats = opt_result[0].stats if opt_result else None
+
+    all_ok = True
+    expected_sources = ['raw', 'pre_agg:n', 'raw']
+    ok, _ = assert_close("30m avg (少中间桶)", baseline, actual, t_start, t_end,
+                          expected_sources=expected_sources, actual_sources=actual_sources)
+    all_ok = all_ok and ok
+
+    if stats:
+        print(f"  命中统计: 预聚合={stats['pre_agg_buckets_used']}, 原始={stats['raw_buckets_used']}")
+
+    if actual_sources:
+        print(f"  桶来源: {actual_sources}")
+
+    return all_ok
+
+
+def test_cross_series_downsample_agg():
+    """
+    TEST 11: 跨序列降采样聚合。
+    - 构造同一 metric 下多条序列
+    - 用 cross_series_agg='avg'/'sum' 合并
+    - 正确基线: 把所有匹配序列的原始点合并后，按桶做 cross_agg
+    - 验证: 结果与基线一致, 每条线复用预聚合, 输出来源 cross_merged
+    """
+    print()
+    print("=" * 70)
+    print("  TEST 11: 跨序列降采样聚合 (多条线复用预聚合)")
+    print("=" * 70)
+
+    storage = StorageEngine()
+    query = QueryEngine(storage)
+
+    base_ts = 1700006400
+    hosts = ['web-01', 'web-02', 'web-03']
+
+    for host in hosts:
+        base_val = {'web-01': 10.0, 'web-02': 20.0, 'web-03': 30.0}[host]
+        for i in range(360):
+            ts = base_ts + i * 10
+            val = base_val + math.sin(i * 0.1)
+            storage.write('cpu', {'host': host, 'region': 'us-east'}, ts, val)
+    storage.flush()
+
+    t_start = base_ts
+    t_end = base_ts + 3600 - 1
+    interval = 1800
+
+    all_ok = True
+
+    series_ids = list(storage.index.get_all_series_for_metric('cpu'))
+    all_raw_points = []
+    for sid in series_ids:
+        all_raw_points.extend(bucket_raw_in_range(storage, sid, t_start, t_end))
+
+    from tsdb.aggregation import aggregate as aggr
+
+    for cross_agg in ['sum', 'avg', 'min', 'max', 'count']:
+        opt_result = query.query(
+            'cpu', {'region': 'us-east'}, t_start, t_end,
+            agg_func='avg', interval=interval, cross_series_agg=cross_agg
+        )
+
+        baseline = baseline_downsample(all_raw_points, t_start, t_end, interval, cross_agg)
+
+        actual = opt_result[0].points if opt_result else []
+        actual_sources = opt_result[0].bucket_sources if opt_result else []
+        stats = opt_result[0].stats if opt_result else None
+
+        ok, _ = assert_close(f"跨序列 {cross_agg} (30m)", baseline, actual, t_start, t_end,
+                              actual_sources=actual_sources)
+        all_ok = all_ok and ok
+
+        if stats:
+            print(f"    桶来源计数: {stats.get('bucket_source_counts', {})}")
+
+        if actual_sources:
+            all_cross = all(s == 'cross_merged' for s in actual_sources)
+            if all_cross:
+                print(f"    ✓ 所有桶来源 = cross_merged")
+            else:
+                print(f"    ✗ 桶来源: {actual_sources} (期望全部 cross_merged)")
+                all_ok = False
+
+    return all_ok
+
+
 def main():
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║    降采样正确性自检 — 7 个测试场景                               ║")
+    print("║    降采样正确性自检 — 11 个测试场景                              ║")
     print("║    每一项都与 \"全扫原始点再聚合\" 的基线结果逐桶比对             ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
     print()
@@ -535,6 +827,10 @@ def main():
     results.append(("TEST 5 边界数据不泄漏", test_boundary_no_leak()))
     results.append(("TEST 6 桶时间戳在范围内", test_bucket_timestamps_in_range()))
     results.append(("TEST 7 预聚合合并真实命中", test_pre_agg_merge_hit_for_uneven_avg()))
+    results.append(("TEST 8 单桶对齐预聚合命中", test_single_bucket_pre_agg()))
+    results.append(("TEST 9 两桶对齐预聚合命中", test_two_buckets_pre_agg()))
+    results.append(("TEST 10 少中间桶场景", test_misaligned_few_middle()))
+    results.append(("TEST 11 跨序列降采样聚合", test_cross_series_downsample_agg()))
 
     print()
     print("=" * 70)
@@ -547,8 +843,11 @@ def main():
         all_pass = all_pass and ok
     print()
     if all_pass:
-        print("  🎉 全部测试通过! 降采样查询与原始点聚合结果在所有场景下完全一致。")
-        print("     其中 TEST 6 验证了桶时间戳不越界, TEST 7 验证了预聚合路径命中。")
+        print("  🎉 全部 11 个测试通过!")
+        print("     TEST 1-7: 原有边界正确性 + 预聚合合并路径验证")
+        print("     TEST 8-9: 1 桶 / 2 桶对齐查询正确命中预聚合")
+        print("     TEST 10:  首尾不对齐但中间只有很少完整桶")
+        print("     TEST 11:  跨序列降采样聚合, 复用每条线预聚合")
     else:
         print("  ⚠ 存在失败测试, 请检查上方输出中标记的错误类型。")
     return all_pass

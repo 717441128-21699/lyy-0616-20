@@ -1,38 +1,63 @@
-from tsdb.aggregation import aggregate
+from tsdb.aggregation import aggregate, AGGREGATORS
 from tsdb.downsample import PREDEFINED_GRANULARITIES
+
+
+SOURCE_RAW = 'raw'
+SOURCE_PRE_AGG_SINGLE = 'pre_agg:1'
+SOURCE_PRE_AGG_MERGED = 'pre_agg:n'
+SOURCE_CROSS_MERGED = 'cross_merged'
 
 
 class QueryResult:
     """
-    Query result with statistics about how the data was computed.
+    Query result with detailed diagnostics about how each bucket was computed.
 
     Attributes:
         series_id: unique identifier for the time series
         tags: tag key-value pairs for the series
         points: list of (timestamp, value) pairs
+        bucket_sources: list of source descriptions, one per point:
+            'raw'                — computed by scanning raw data points
+            'pre_agg:1'          — came from a single pre-agg bucket directly
+            'pre_agg:n'          — merged from multiple smaller pre-agg buckets
+            'cross_merged'       — merged across multiple series (cross-series agg)
         stats: dictionary with performance/debug info:
-            - pre_agg_buckets_used: number of output buckets from pre-agg merge
-            - raw_buckets_used: number of output buckets computed from raw data
+            - pre_agg_buckets_used: output buckets from pre-agg (single or merged)
+            - raw_buckets_used: output buckets computed from raw data
             - source_granularity: pre-agg granularity name used (e.g. '15m')
             - total_buckets: total output buckets
             - pre_agg_hit_ratio: pre_agg_buckets_used / total_buckets
+            - bucket_source_counts: counts per source kind
     """
-    def __init__(self, series_id, tags, points, stats=None):
+    def __init__(self, series_id, tags, points, bucket_sources=None, stats=None):
         self.series_id = series_id
         self.tags = tags
         self.points = points
+        self.bucket_sources = bucket_sources or ([SOURCE_RAW] * len(points))
+        default_counts = {
+            SOURCE_RAW: sum(1 for s in self.bucket_sources if s == SOURCE_RAW),
+            SOURCE_PRE_AGG_SINGLE: sum(1 for s in self.bucket_sources if s == SOURCE_PRE_AGG_SINGLE),
+            SOURCE_PRE_AGG_MERGED: sum(1 for s in self.bucket_sources if s == SOURCE_PRE_AGG_MERGED),
+            SOURCE_CROSS_MERGED: sum(1 for s in self.bucket_sources if s == SOURCE_CROSS_MERGED),
+        }
+        pre_agg_count = default_counts[SOURCE_PRE_AGG_SINGLE] + default_counts[SOURCE_PRE_AGG_MERGED]
         self.stats = stats or {
-            'pre_agg_buckets_used': 0,
-            'raw_buckets_used': 0,
+            'pre_agg_buckets_used': pre_agg_count,
+            'raw_buckets_used': default_counts[SOURCE_RAW],
             'source_granularity': None,
             'total_buckets': len(points),
-            'pre_agg_hit_ratio': 0.0,
+            'pre_agg_hit_ratio': pre_agg_count / len(points) if points else 0.0,
+            'bucket_source_counts': default_counts,
         }
 
     def __repr__(self):
         n = len(self.points)
-        preview = self.points[:5] if n > 5 else self.points
-        pts_str = ', '.join(f'({t}, {v:.2f})' for t, v in preview)
+        preview_lines = []
+        for i in range(min(5, n)):
+            t, v = self.points[i]
+            src = self.bucket_sources[i] if i < len(self.bucket_sources) else '?'
+            preview_lines.append(f'({t}, {v:.2f}, src={src})')
+        pts_str = ', '.join(preview_lines)
         if n > 5:
             pts_str += f', ... (+{n-5} more)'
         return f'QueryResult(series={self.series_id}, points=[{pts_str}])'
@@ -68,7 +93,7 @@ class QueryEngine:
         self.storage = storage
 
     def query(self, metric, tag_filters=None, t_start=0, t_end=2**63,
-              agg_func=None, interval=None):
+              agg_func=None, interval=None, cross_series_agg=None):
         """
         Execute a query.
 
@@ -77,30 +102,44 @@ class QueryEngine:
             tag_filters: dict of {tag_key: tag_value_or_condition}
             t_start: start timestamp (inclusive)
             t_end: end timestamp (inclusive)
-            agg_func: aggregation function name (sum, avg, min, max, count)
+            agg_func: per-series aggregation function name (sum, avg, min, max, count)
             interval: downsampling interval in seconds (None = no downsampling)
+            cross_series_agg: if provided AND multiple series match, merge all
+                              series into one output using this aggregation
+                              function across series per time bucket. Also
+                              reuses per-series pre-aggregation.
 
         Returns:
-            list of QueryResult, one per matching series
+            list of QueryResult, one per matching series (or one merged result)
         """
         if tag_filters is None:
             tag_filters = {}
         matching = self.storage.index.match(metric, tag_filters)
         if not matching:
             return []
+
+        if interval is not None and interval > 0 and cross_series_agg is not None:
+            return [self._query_cross_series_downsampled(
+                metric, matching, t_start, t_end,
+                agg_func or 'avg', interval, cross_series_agg
+            )]
+
         results = []
         for series_id in sorted(matching):
             tags = self.storage.index.get_series_tags(series_id)
             if interval is not None and interval > 0:
-                points, stats = self._query_downsampled(series_id, t_start, t_end,
-                                                          agg_func or 'avg', interval)
-                results.append(QueryResult(series_id, tags, points, stats))
+                points, sources, gran_name = self._query_downsampled(
+                    series_id, t_start, t_end, agg_func or 'avg', interval
+                )
+                stats = self._make_stats_from_sources(sources, gran_name)
+                results.append(QueryResult(series_id, tags, points, sources, stats))
             elif agg_func is not None:
                 points = self._query_aggregate(series_id, t_start, t_end, agg_func)
                 results.append(QueryResult(series_id, tags, points))
             else:
                 points = self._query_raw(series_id, t_start, t_end)
                 results.append(QueryResult(series_id, tags, points))
+
         if agg_func and len(results) > 1 and interval is None:
             merged = self._cross_series_aggregate(results, agg_func)
             return [QueryResult(f'{metric}::__aggregate__', {}, merged)]
@@ -118,135 +157,248 @@ class QueryEngine:
 
     def _query_downsampled(self, series_id, t_start, t_end, agg_func, interval):
         """
-        Downsampled query with strict boundary enforcement and weighted merging.
+        Downsampled query with PER-BUCKET source decision.
 
-        ARCHITECTURE:
-        ┌───────────────────────────────────────────────────────────────┐
-        │  [t_start: first partial bucket]  [full pre-agg buckets]     │
-        │  [last partial bucket: t_end]                                │
-        │                                                               │
-        │  1st & last bucket  → always from RAW DATA (strict boundary)  │
-        │  Middle buckets     → pre-agg merge (count-weighted avg)      │
-        │  Timestamp output  → first bucket bt = max(bt, t_start)      │
-        │                       last bucket bt = bt (floor-aligned)     │
-        │                       but bt must be <= t_end                  │
-        └───────────────────────────────────────────────────────────────┘
+        For every output bucket (aligned to dst_interval boundaries), check:
+        - Is the bucket fully contained in [t_start, t_end] AND all its
+          sub-pre-agg buckets exist? If yes → use pre-agg merge.
+        - Otherwise → read raw data points strictly within the overlap.
 
-        This guarantees:
-        - No data outside [t_start, t_end] ever leaks in
-        - First bucket timestamp never < t_start
-        - Last bucket timestamp never implies data beyond t_end
-        - Middle buckets truly use pre-aggregation (not raw scan)
-        - avg uses count-weighted merging for uneven point distributions
+        Timestamp output:
+        - If first floor-aligned bucket bt < t_start → output bt = t_start
+        - Last bucket bt = floor-aligned bt (<= t_end by construction)
+        - Middle buckets = floor-aligned bt
+
+        This works for 1-bucket, 2-bucket, and many-bucket queries alike —
+        every bucket gets an independent decision, no artificial distinction
+        between "first/last" and "middle".
         """
         best_gran = self._find_best_granularity(interval)
+        gran_name = best_gran
 
-        first_bucket_bt = (t_start // interval) * interval
-        last_bucket_bt = (t_end // interval) * interval
-        total_buckets = (last_bucket_bt - first_bucket_bt) // interval + 1
+        first_bt_floor = (t_start // interval) * interval
+        last_bt_floor = (t_end // interval) * interval
 
-        if total_buckets <= 0:
-            return [], self._make_stats(0, 0, None)
+        results = []
+        sources = []
 
-        first_bucket_end = first_bucket_bt + interval - 1
-        last_bucket_start = last_bucket_bt
+        for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+            dst_end = dst_bt + interval - 1
 
-        has_first = total_buckets >= 1
-        has_last = total_buckets >= 2 and last_bucket_bt > first_bucket_bt
-        has_middle = total_buckets >= 3
+            overlap_start = max(dst_bt, t_start)
+            overlap_end = min(dst_end, t_end)
 
-        pre_agg_count = 0
-        raw_count = 0
-        gran_name = None
+            if overlap_start > overlap_end:
+                continue
 
-        pre_agg_results = []
-        raw_results = []
+            use_pre_agg = False
+            merged_val = None
+            source_kind = SOURCE_RAW
 
-        if has_first:
-            raw_start = max(first_bucket_bt, t_start)
-            raw_end = min(first_bucket_end, t_end)
-            first_points = list(self.storage.read_series_range(series_id, raw_start, raw_end))
-            if first_points:
-                val = aggregate(first_points, agg_func)
-                first_bt_adjusted = max(first_bucket_bt, t_start)
-                raw_results.append((first_bt_adjusted, val))
-            raw_count += 1
+            if best_gran is not None:
+                gran_interval = PREDEFINED_GRANULARITIES[best_gran]
+                bucket_fully_inside = (dst_bt >= t_start and dst_end <= t_end)
+                divisible = (interval % gran_interval == 0)
 
-        if has_last and last_bucket_bt > first_bucket_bt:
-            raw_start = max(last_bucket_start, t_start)
-            raw_end = min(last_bucket_start + interval - 1, t_end)
-            last_points = list(self.storage.read_series_range(series_id, raw_start, raw_end))
-            if last_points:
-                val = aggregate(last_points, agg_func)
-                raw_results.append((last_bucket_bt, val))
-            raw_count += 1
+                if bucket_fully_inside and divisible:
+                    num_sub = interval // gran_interval
+                    sub_buckets = []
+                    all_found = True
+                    for i in range(num_sub):
+                        sub_bt = dst_bt + i * gran_interval
+                        raw_b = self.storage.downsample.get_raw_buckets(
+                            series_id, best_gran, sub_bt, sub_bt + gran_interval
+                        )
+                        if not raw_b or raw_b[0][0] != sub_bt:
+                            all_found = False
+                            break
+                        sub_buckets.append(raw_b[0][1])
+                    if all_found and sub_buckets:
+                        merged_val = self._combine_bucket(sub_buckets, agg_func)
+                        use_pre_agg = True
+                        source_kind = SOURCE_PRE_AGG_MERGED if num_sub > 1 else SOURCE_PRE_AGG_SINGLE
 
-        if has_middle and best_gran is not None:
-            gran_interval = PREDEFINED_GRANULARITIES[best_gran]
-            gran_name = best_gran
-
-            middle_start_bt = first_bucket_bt + interval
-            middle_end_bt = last_bucket_bt - interval
-
-            for dst_bt in range(middle_start_bt, middle_end_bt + 1, interval):
-                dst_end = dst_bt + interval - 1
-                if dst_bt < t_start or dst_end > t_end:
-                    raw_count += 1
-                    raw_pts = list(self.storage.read_series_range(series_id, dst_bt, dst_end))
-                    if raw_pts:
-                        raw_results.append((dst_bt, aggregate(raw_pts, agg_func)))
-                    continue
-
-                if interval % gran_interval != 0:
-                    raw_count += 1
-                    raw_pts = list(self.storage.read_series_range(series_id, dst_bt, dst_end))
-                    if raw_pts:
-                        raw_results.append((dst_bt, aggregate(raw_pts, agg_func)))
-                    continue
-
-                num_sub_buckets = interval // gran_interval
-                sub_buckets = []
-                all_found = True
-                for i in range(num_sub_buckets):
-                    sub_bt = dst_bt + i * gran_interval
-                    raw_b = self.storage.downsample.get_raw_buckets(
-                        series_id, best_gran, sub_bt, sub_bt + gran_interval
-                    )
-                    if not raw_b or raw_b[0][0] != sub_bt:
-                        all_found = False
-                        break
-                    sub_buckets.append(raw_b[0][1])
-                if all_found and sub_buckets:
-                    val = self._combine_bucket(sub_buckets, agg_func)
-                    pre_agg_results.append((dst_bt, val))
-                    pre_agg_count += 1
-                else:
-                    raw_count += 1
-                    raw_pts = list(self.storage.read_series_range(series_id, dst_bt, dst_end))
-                    if raw_pts:
-                        raw_results.append((dst_bt, aggregate(raw_pts, agg_func)))
-        elif has_middle and best_gran is None:
-            middle_start_bt = first_bucket_bt + interval
-            middle_end_bt = last_bucket_bt - interval
-            for dst_bt in range(middle_start_bt, middle_end_bt + 1, interval):
-                dst_end = dst_bt + interval - 1
-                raw_pts = list(self.storage.read_series_range(series_id, dst_bt, dst_end))
+            if use_pre_agg:
+                out_bt = dst_bt if dst_bt >= t_start else t_start
+                results.append((out_bt, merged_val))
+                sources.append(source_kind)
+            else:
+                raw_pts = list(self.storage.read_series_range(
+                    series_id, overlap_start, overlap_end
+                ))
                 if raw_pts:
-                    raw_results.append((dst_bt, aggregate(raw_pts, agg_func)))
-                raw_count += 1
+                    val = aggregate(raw_pts, agg_func)
+                    out_bt = dst_bt if dst_bt >= t_start else t_start
+                    results.append((out_bt, val))
+                    sources.append(SOURCE_RAW)
 
-        merged = self._merge_results(pre_agg_results, raw_results)
-        stats = self._make_stats(pre_agg_count, raw_count, gran_name)
-        return merged, stats
+        return results, sources, gran_name
 
-    def _make_stats(self, pre_agg_count, raw_count, gran_name):
-        total = pre_agg_count + raw_count
+    def _query_cross_series_downsampled(self, metric, series_ids, t_start, t_end,
+                                         per_series_agg, interval, cross_agg):
+        """
+        Downsample across multiple series and aggregate them into one curve.
+
+        Strategy: reuse per-series pre-aggregation where possible.
+        1. For each series, obtain downsampled (ts, val) list — but instead
+           of just the final value, also get the raw bucket stats (count,
+           sum, min, max) for correct cross-series weighted combining.
+        2. For each time bucket, merge stats across series using cross_agg.
+        3. For 'avg' across series: (sum of all sums) / (sum of all counts)
+           — this is the count-weighted average across ALL points of ALL
+           series in that bucket.
+
+        Returns a single QueryResult.
+        """
+        best_gran = self._find_best_granularity(interval)
+        gran_interval = PREDEFINED_GRANULARITIES.get(best_gran, None)
+
+        first_bt_floor = (t_start // interval) * interval
+        last_bt_floor = (t_end // interval) * interval
+
+        bucket_stats_by_time = {}
+        bucket_sources = {}
+
+        for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+            dst_end = dst_bt + interval - 1
+            overlap_start = max(dst_bt, t_start)
+            overlap_end = min(dst_end, t_end)
+            if overlap_start > overlap_end:
+                continue
+            bucket_stats_by_time[dst_bt] = []
+            bucket_sources[dst_bt] = []
+
+        for series_id in sorted(series_ids):
+            for dst_bt in range(first_bt_floor, last_bt_floor + 1, interval):
+                dst_end = dst_bt + interval - 1
+                overlap_start = max(dst_bt, t_start)
+                overlap_end = min(dst_end, t_end)
+                if overlap_start > overlap_end:
+                    continue
+
+                stats = None
+                src = SOURCE_RAW
+
+                if best_gran is not None and dst_bt >= t_start and dst_end <= t_end \
+                        and interval % gran_interval == 0:
+                    num_sub = interval // gran_interval
+                    sub_buckets = []
+                    all_found = True
+                    for i in range(num_sub):
+                        sub_bt = dst_bt + i * gran_interval
+                        raw_b = self.storage.downsample.get_raw_buckets(
+                            series_id, best_gran, sub_bt, sub_bt + gran_interval
+                        )
+                        if not raw_b or raw_b[0][0] != sub_bt:
+                            all_found = False
+                            break
+                        sub_buckets.append(raw_b[0][1])
+                    if all_found and sub_buckets:
+                        stats = self._merge_bucket_stats(sub_buckets)
+                        src = SOURCE_PRE_AGG_MERGED if num_sub > 1 else SOURCE_PRE_AGG_SINGLE
+
+                if stats is None:
+                    raw_pts = list(self.storage.read_series_range(
+                        series_id, overlap_start, overlap_end
+                    ))
+                    if raw_pts:
+                        stats = self._points_to_stats(raw_pts)
+                        src = SOURCE_RAW
+
+                if stats is not None:
+                    bucket_stats_by_time[dst_bt].append(stats)
+                    bucket_sources[dst_bt].append(src)
+
+        output_points = []
+        output_sources = []
+        for dst_bt in sorted(bucket_stats_by_time.keys()):
+            stats_list = bucket_stats_by_time[dst_bt]
+            if not stats_list:
+                continue
+            combined_val = self._cross_agg_from_stats(stats_list, cross_agg)
+            out_bt = dst_bt if dst_bt >= t_start else t_start
+            output_points.append((out_bt, combined_val))
+            output_sources.append(SOURCE_CROSS_MERGED)
+
+        stats = self._make_stats_from_sources(output_sources, best_gran)
+        return QueryResult(
+            f'{metric}::__cross_agg__', {}, output_points, output_sources, stats
+        )
+
+    def _points_to_stats(self, points):
+        """Convert list of (ts, val) into a bucket stats dict."""
+        if not points:
+            return None
+        vals = [v for _, v in points]
         return {
-            'pre_agg_buckets_used': pre_agg_count,
-            'raw_buckets_used': raw_count,
+            'count': len(points),
+            'sum': sum(vals),
+            'min': min(vals),
+            'max': max(vals),
+            'first_ts': points[0][0],
+            'first_val': points[0][1],
+            'last_ts': points[-1][0],
+            'last_val': points[-1][1],
+        }
+
+    def _merge_bucket_stats(self, bucket_list):
+        """Merge multiple bucket stats dicts into one (across sub-buckets of same series)."""
+        total_count = sum(b['count'] for b in bucket_list)
+        total_sum = sum(b['sum'] for b in bucket_list)
+        overall_min = min(b['min'] for b in bucket_list)
+        overall_max = max(b['max'] for b in bucket_list)
+        first = min(bucket_list, key=lambda b: b['first_ts'])
+        last = max(bucket_list, key=lambda b: b['last_ts'])
+        return {
+            'count': total_count,
+            'sum': total_sum,
+            'min': overall_min,
+            'max': overall_max,
+            'first_ts': first['first_ts'],
+            'first_val': first['first_val'],
+            'last_ts': last['last_ts'],
+            'last_val': last['last_val'],
+        }
+
+    def _cross_agg_from_stats(self, stats_list, cross_agg):
+        """Combine per-series bucket stats into one cross-series value."""
+        if cross_agg == 'sum':
+            return sum(s['sum'] for s in stats_list)
+        elif cross_agg == 'avg':
+            total_sum = sum(s['sum'] for s in stats_list)
+            total_count = sum(s['count'] for s in stats_list)
+            return total_sum / total_count if total_count > 0 else 0.0
+        elif cross_agg == 'min':
+            return min(s['min'] for s in stats_list)
+        elif cross_agg == 'max':
+            return max(s['max'] for s in stats_list)
+        elif cross_agg == 'count':
+            return sum(s['count'] for s in stats_list)
+        elif cross_agg == 'first':
+            earliest = min(stats_list, key=lambda s: s['first_ts'])
+            return earliest['first_val']
+        elif cross_agg == 'last':
+            latest = max(stats_list, key=lambda s: s['last_ts'])
+            return latest['last_val']
+        else:
+            raise ValueError(f"Unknown cross-series agg: {cross_agg}")
+
+    def _make_stats_from_sources(self, sources, gran_name):
+        counts = {
+            SOURCE_RAW: sum(1 for s in sources if s == SOURCE_RAW),
+            SOURCE_PRE_AGG_SINGLE: sum(1 for s in sources if s == SOURCE_PRE_AGG_SINGLE),
+            SOURCE_PRE_AGG_MERGED: sum(1 for s in sources if s == SOURCE_PRE_AGG_MERGED),
+            SOURCE_CROSS_MERGED: sum(1 for s in sources if s == SOURCE_CROSS_MERGED),
+        }
+        pre_agg = counts[SOURCE_PRE_AGG_SINGLE] + counts[SOURCE_PRE_AGG_MERGED]
+        total = len(sources)
+        return {
+            'pre_agg_buckets_used': pre_agg,
+            'raw_buckets_used': counts[SOURCE_RAW],
             'source_granularity': gran_name,
             'total_buckets': total,
-            'pre_agg_hit_ratio': pre_agg_count / total if total > 0 else 0.0,
+            'pre_agg_hit_ratio': pre_agg / total if total > 0 else 0.0,
+            'bucket_source_counts': counts,
         }
 
     def _combine_bucket(self, bucket_list, agg_func):
