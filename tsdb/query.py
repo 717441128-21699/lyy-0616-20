@@ -95,48 +95,194 @@ class QueryEngine:
 
     def _query_downsampled(self, series_id, t_start, t_end, agg_func, interval):
         """
-        Downsampled query with seamless pre-agg / raw-data stitching.
+        Downsampled query with strict boundary enforcement and weighted merging.
 
-        Algorithm:
-        1. Find the best matching pre-aggregation granularity:
-           - Pick the coarsest granularity g where g <= interval.
-           - E.g., for interval=1800s (30min), pick g=900s (15min)
-             then aggregate 2 pre-agg buckets into each output bucket.
-        2. Fetch complete pre-agg buckets covering [t_start, partial_start).
-        3. For the partial bucket region [partial_start, t_end]:
-           - Read raw data from relevant chunks.
-           - Aggregate on the fly into the output interval.
-        4. Merge both sets of results.
+        Key correctness guarantees:
+        1. EVERY output bucket is strictly within [t_start, t_end].
+           No data outside the query range leaks into the result.
+        2. Pre-aggregation buckets are only used when they are FULLY CONTAINED
+           within [t_start, t_end]. If a pre-agg bucket overlaps the boundary
+           (e.g. t_start falls in the middle of a 15m bucket), we DO NOT use
+           that pre-agg value — we read raw points for the partial region
+           and aggregate on the fly.
+        3. When merging smaller pre-agg buckets into larger output intervals
+           (e.g. 2x 15min → 30min), 'avg' and 'sum' use count-weighted merging:
+               merged_avg = (count1*avg1 + count2*avg2) / (count1+count2)
+                          = (sum1 + sum2) / (count1 + count2)
+           This ensures correctness even when data points are unevenly
+           distributed across sub-buckets.
         """
         best_gran = self._find_best_granularity(interval)
-        if best_gran is not None:
-            complete, partial_info = self.storage.downsample.get_all_for_series(
-                series_id, best_gran, t_start, t_end, agg_func
-            )
-            partial_key, partial_bucket = partial_info
-            raw_points = []
-            if partial_bucket is not None:
-                raw_t_start = partial_key
-                raw_points = list(self.storage.read_series_range(
-                    series_id, raw_t_start, t_end
-                ))
-            else:
-                uncovered = self._find_uncovered_range(
-                    complete, best_gran, t_start, t_end
-                )
-                if uncovered:
-                    raw_points = list(self.storage.read_series_range(
-                        series_id, uncovered[0], uncovered[1]
-                    ))
-            if best_gran != interval:
-                complete = self._reaggregate(complete, best_gran, interval, agg_func)
-            raw_bucketed = self._bucket_raw(raw_points, interval, agg_func)
-            merged = self._merge_results(complete, raw_bucketed)
-            return merged
-        return self._bucket_raw(
-            list(self.storage.read_series_range(series_id, t_start, t_end)),
-            interval, agg_func
+
+        if best_gran is None:
+            all_raw = list(self.storage.read_series_range(series_id, t_start, t_end))
+            return self._bucket_raw_strict(all_raw, t_start, t_end, interval, agg_func)
+
+        gran_interval = PREDEFINED_GRANULARITIES[best_gran]
+
+        raw_buckets = self.storage.downsample.get_raw_buckets(
+            series_id, best_gran, t_start, t_end
         )
+
+        raw_regions = self._find_raw_regions(t_start, t_end, raw_buckets, gran_interval, interval)
+
+        all_raw_points = []
+        for r_start, r_end in raw_regions:
+            all_raw_points.extend(
+                list(self.storage.read_series_range(series_id, r_start, r_end))
+            )
+
+        pre_agg_bucketed = self._reaggregate_raw_buckets(
+            raw_buckets, gran_interval, interval, agg_func
+        )
+
+        raw_bucketed = self._bucket_raw_strict(
+            all_raw_points, t_start, t_end, interval, agg_func
+        )
+
+        merged = self._merge_results(pre_agg_bucketed, raw_bucketed)
+        return merged
+
+    def _find_raw_regions(self, t_start, t_end, raw_buckets, gran_interval, dst_interval):
+        """
+        Identify time regions that MUST be computed from raw data because
+        they either:
+        1. Overlap a query boundary (pre-agg bucket not fully inside [t_start, t_end])
+        2. Contain a dst_interval boundary not aligned to the pre-agg granularity,
+           meaning pre-agg buckets can only partially contribute
+
+        Returns list of (r_start, r_end) inclusive timestamp ranges.
+        """
+        if not raw_buckets:
+            return [(t_start, t_end)]
+
+        covered = set(bts for bts, _ in raw_buckets)
+
+        first_gran_bucket = (t_start // gran_interval) * gran_interval
+        last_gran_bucket = ((t_end) // gran_interval) * gran_interval
+
+        regions = []
+
+        current_region_start = None
+        current_region_end = None
+
+        gran_bts = first_gran_bucket
+        while gran_bts <= last_gran_bucket:
+            gran_end = gran_bts + gran_interval - 1
+
+            is_fully_inside = gran_bts >= t_start and gran_end <= t_end
+
+            if is_fully_inside and gran_bts in covered:
+                bucket_starts_at_dst_boundary = (gran_bts % dst_interval == 0)
+                bucket_ends_at_dst_boundary = ((gran_end + 1) % dst_interval == 0)
+
+                if bucket_starts_at_dst_boundary and bucket_ends_at_dst_boundary:
+                    if current_region_start is not None:
+                        regions.append((current_region_start, current_region_end))
+                        current_region_start = None
+                        current_region_end = None
+                    gran_bts += gran_interval
+                    continue
+
+            overlap_start = max(gran_bts, t_start)
+            overlap_end = min(gran_end, t_end)
+
+            if current_region_start is None:
+                current_region_start = overlap_start
+                current_region_end = overlap_end
+            else:
+                if overlap_start <= current_region_end + 1:
+                    current_region_end = max(current_region_end, overlap_end)
+                else:
+                    regions.append((current_region_start, current_region_end))
+                    current_region_start = overlap_start
+                    current_region_end = overlap_end
+
+            gran_bts += gran_interval
+
+        if current_region_start is not None:
+            regions.append((current_region_start, current_region_end))
+
+        return regions
+
+    def _reaggregate_raw_buckets(self, raw_buckets, src_interval, dst_interval, agg_func):
+        """
+        Merge pre-aggregation buckets into target output intervals using
+        COUNT-WEIGHTED combining.
+
+        CRITICAL SAFETY FILTER: Only includes pre-agg buckets whose
+        [bts, bts+src_interval) is FULLY ALIGNED to dst_interval boundaries.
+        Buckets that span a dst_interval boundary are excluded — they're
+        computed from raw data instead to guarantee correctness.
+        """
+        if not raw_buckets:
+            return []
+        if src_interval == dst_interval:
+            results = []
+            for bts, b in raw_buckets:
+                if bts % dst_interval == 0:
+                    results.append((bts, self._combine_bucket([b], agg_func)))
+            return results
+        groups = {}
+        for bts, b in raw_buckets:
+            if bts % dst_interval != 0:
+                continue
+            if (bts + src_interval) % dst_interval != 0:
+                continue
+            dst_bts = (bts // dst_interval) * dst_interval
+            groups.setdefault(dst_bts, []).append(b)
+        results = []
+        for dst_bts in sorted(groups.keys()):
+            results.append((dst_bts, self._combine_bucket(groups[dst_bts], agg_func)))
+        return results
+
+    def _combine_bucket(self, bucket_list, agg_func):
+        """
+        Combine multiple raw pre-agg buckets into a single aggregate value.
+
+        Uses count/sum/min/max from the raw bucket dicts so 'avg' is correctly
+        weighted even with uneven point counts across sub-buckets.
+        """
+        total_count = sum(b['count'] for b in bucket_list)
+        total_sum = sum(b['sum'] for b in bucket_list)
+        if agg_func == 'sum':
+            return total_sum
+        elif agg_func == 'avg':
+            return total_sum / total_count if total_count > 0 else 0.0
+        elif agg_func == 'min':
+            return min(b['min'] for b in bucket_list)
+        elif agg_func == 'max':
+            return max(b['max'] for b in bucket_list)
+        elif agg_func == 'count':
+            return total_count
+        elif agg_func == 'first':
+            earliest = min(bucket_list, key=lambda b: b['first_ts'])
+            return earliest['first_val']
+        elif agg_func == 'last':
+            latest = max(bucket_list, key=lambda b: b['last_ts'])
+            return latest['last_val']
+        else:
+            return total_sum / total_count if total_count > 0 else 0.0
+
+    def _bucket_raw_strict(self, raw_points, t_start, t_end, interval, agg_func):
+        """
+        Bucket raw points into output intervals, strictly respecting [t_start, t_end].
+
+        Each output bucket's time label is the floor-aligned start of the interval
+        that contains it. Buckets outside [t_start, t_end) are discarded.
+        """
+        if not raw_points:
+            return []
+        buckets = {}
+        for ts, val in raw_points:
+            if ts < t_start or ts > t_end:
+                continue
+            bucket_ts = (ts // interval) * interval
+            buckets.setdefault(bucket_ts, []).append((ts, val))
+        results = []
+        for bts in sorted(buckets.keys()):
+            results.append((bts, aggregate(buckets[bts], agg_func)))
+        return results
 
     def _find_best_granularity(self, interval):
         best = None
@@ -145,54 +291,6 @@ class QueryEngine:
                 best = name
                 break
         return best
-
-    def _find_uncovered_range(self, complete_points, gran_name, t_start, t_end):
-        if not complete_points:
-            return (t_start, t_end)
-        gran = PREDEFINED_GRANULARITIES[gran_name]
-        last_covered = max(ts for ts, _ in complete_points) + gran
-        if last_covered < t_end:
-            return (last_covered, t_end)
-        return None
-
-    def _reaggregate(self, points, src_gran, dst_interval, agg_func):
-        if not points:
-            return []
-        src_interval = PREDEFINED_GRANULARITIES[src_gran]
-        if src_interval == dst_interval:
-            return points
-        buckets = {}
-        for ts, val in points:
-            bucket_ts = (ts // dst_interval) * dst_interval
-            buckets.setdefault(bucket_ts, []).append(val)
-        results = []
-        for bts in sorted(buckets.keys()):
-            vals = buckets[bts]
-            if agg_func == 'sum':
-                results.append((bts, sum(vals)))
-            elif agg_func == 'avg':
-                results.append((bts, sum(vals) / len(vals)))
-            elif agg_func == 'min':
-                results.append((bts, min(vals)))
-            elif agg_func == 'max':
-                results.append((bts, max(vals)))
-            elif agg_func == 'count':
-                results.append((bts, sum(vals)))
-            else:
-                results.append((bts, sum(vals) / len(vals)))
-        return results
-
-    def _bucket_raw(self, raw_points, interval, agg_func):
-        if not raw_points:
-            return []
-        buckets = {}
-        for ts, val in raw_points:
-            bucket_ts = (ts // interval) * interval
-            buckets.setdefault(bucket_ts, []).append((ts, val))
-        results = []
-        for bts in sorted(buckets.keys()):
-            results.append((bts, aggregate(buckets[bts], agg_func)))
-        return results
 
     def _merge_results(self, pre_agg, raw_bucketed):
         seen = set()

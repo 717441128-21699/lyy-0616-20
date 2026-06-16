@@ -78,25 +78,41 @@ class DownsampleStore:
                 b['last_ts'] = ts
                 b['last_val'] = value
 
-    def query_pre_agg(self, series_id, granularity, t_start, t_end, agg_func):
+    def get_raw_buckets(self, series_id, granularity, t_start, t_end):
         """
-        Query pre-aggregated data. Returns list of (bucket_ts, agg_value).
-        Only returns fully-formed buckets (complete time intervals).
+        Return raw pre-agg bucket data with full stats for correct merging.
+
+        CRITICAL for strict boundary enforcement:
+        Only returns buckets whose [bts, bts+interval) is FULLY CONTAINED
+        within [t_start, t_end). Partially-overlapping buckets at the edges
+        are excluded — the caller must compute those from raw data to
+        avoid including data points outside the query range.
+
+        Returns list of (bucket_ts, bucket_dict) where bucket_dict contains
+        {count, sum, min, max, first_val, last_val, first_ts, last_ts}.
         """
         if granularity not in self._granularities:
             return []
         interval = self._granularities[granularity]
         results = []
-        bucket_start = (t_start // interval) * interval
-        now_approx = t_end
-        for bts in range(bucket_start, t_end + 1, interval):
+        search_start = (t_start // interval) * interval
+        for bts in range(search_start, t_end + 1, interval):
             key = (series_id, granularity, bts)
             if key not in self._buckets:
                 continue
-            b = self._buckets[key]
-            if bts + interval > now_approx:
+            if bts < t_start or bts + interval > t_end:
                 continue
-            points = list(range(b['count']))
+            results.append((bts, dict(self._buckets[key])))
+        return results
+
+    def query_pre_agg(self, series_id, granularity, t_start, t_end, agg_func):
+        """
+        Query pre-aggregated data. Returns list of (bucket_ts, agg_value).
+        Only returns fully-formed buckets strictly inside [t_start, t_end].
+        """
+        raw = self.get_raw_buckets(series_id, granularity, t_start, t_end)
+        results = []
+        for bts, b in raw:
             if agg_func == 'sum':
                 results.append((bts, b['sum']))
             elif agg_func == 'avg':
@@ -116,10 +132,7 @@ class DownsampleStore:
         return results
 
     def get_all_for_series(self, series_id, granularity, t_start, t_end, agg_func):
-        """
-        Get all pre-agg buckets (including the partial/incomplete one)
-        for seamless stitching with raw data.
-        """
+        """Legacy wrapper — kept for API compatibility."""
         if granularity not in self._granularities:
             return [], None
         interval = self._granularities[granularity]
